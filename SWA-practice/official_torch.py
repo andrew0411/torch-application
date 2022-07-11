@@ -140,5 +140,72 @@ class SWALR(_LRScheduler):
         -- annealing_strategy   (str, default; 'cos')   : | 'cos' | 'linear' |
         -- lalst_epoch          (int, default; -1)      : 마지막 epoch의 index
 
-    
+    note ::
+        학습 초반에는 다른 scheduler로 학습하다가 중반부터 SWA로 학습하는 것도 가능
+
+        ex) 
+        if i > swa_start:
+            swa_scheduler.step()
+        else:
+            scheduler.step()
     '''
+    def __init__(self, optimizer, swa_lr, anneal_epochs=10, anneal_strategy='cos', last_epoch=-1):
+        swa_lrs = self._format_param(optimizer, swa_lr)
+        for swa_lr, group in zip(swa_lrs, optimizer.param_groups):
+            group['swa_lr'] = swa_lr
+        if anneal_strategy not in ['cos', 'linear']:
+            raise ValueError('anneal_strategy must be one of "cos" or "linear"' f'instead got {anneal_strategy}')
+        
+        elif anneal_strategy =='cos':
+            self.anneal_func = self._cosine_anneal
+        elif anneal_strategy =='linear':
+            self.anneal_func = self._linear_anneal
+        
+        if not isinstance(anneal_epochs, int) or anneal_epochs < 0:
+            raise ValueError(f'anneal_epochs must be equal or greater than 0, got {anneal_epochs}')
+        self.anneal_epochs = anneal_epochs
+        super(SWALR, self).__init__(optimizer, last_epoch)
+
+    @staticmethod
+    def _format_param(optimizer, swa_lrs):
+        if isinstance(swa_lrs, (list, tuple)):
+            if len(swa_lrs) != len(optimizer.param_groups):
+                raise ValueError('swa_lr must have the same length as '
+                f'optimizer.param_groups : swa_lr has {len(swa_lrs)},'
+                f'optimizer.param_groups has {len(optimizer.param_groups)}')
+            
+            return swa_lrs
+        else:
+            return [swa_lrs] * len(optimizer.param_groups)
+
+    
+    @staticmethod
+    def _linear_anneal(t):
+        return t
+
+    @staticmethod
+    def _cosine_anneal(t):
+        return (1 - math.cos(math.pi * t)) / 2
+
+    @staticmethod
+    def _get_initial_lr(lr, swa_lr, alpha):
+        if alpha == 1:
+            return swa_lr
+        return (lr - alpha * swa_lr) / (1 - alpha)
+
+    
+    def get_lr(self):
+        if not self._get_lr_called_within_step:
+            warnings.warn("To get the last learning rate computed by the scheduler, "
+                          "please use `get_last_lr()`.", UserWarning)
+        step = self._step_count - 1
+        if self.anneal_epochs == 0:
+            step = max(1, step)
+        prev_t = max(0, min(1, (step - 1) / max(1, self.anneal_epochs)))
+        prev_alpha = self.anneal_func(prev_t)
+        prev_lrs = [self._get_initial_lr(group['lr'], group['swa_lr'], prev_alpha)
+                    for group in self.optimizer.param_groups]
+        t = max(0, min(1, step / max(1, self.anneal_epochs)))
+        alpha = self.anneal_func(t)
+        return [group['swa_lr'] * alpha + lr * (1 - alpha)
+                for group, lr in zip(self.optimizer.param_groups, prev_lrs)]
